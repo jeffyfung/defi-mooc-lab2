@@ -9,12 +9,16 @@ import "hardhat/console.sol";
 // https://docs.aave.com/developers/the-core-protocol/lendingpool/ilendingpool
 
 interface ILendingPoolAddressProvider {
-
     function getLendingPool()
     external
     view
     returns (address);
 
+    function getPriceOracle() external view returns (address);
+}
+
+interface IPriceOracleGetter {
+    function getAssetPrice(address _asset) external view returns (uint256);
 }
 
 interface ILendingPool {
@@ -58,6 +62,25 @@ interface ILendingPool {
         uint256 ltv,
         uint256 healthFactor
     );
+}
+
+interface IProtocolDataProvider {
+
+    function getUserReserveData(address asset, address user)
+    external
+    view
+    returns (
+        uint256 currentATokenBalance,
+        uint256 currentStableDebt,
+        uint256 currentVariableDebt,
+        uint256 principalStableDebt,
+        uint256 scaledVariableDebt,
+        uint256 stableBorrowRate,
+        uint256 liquidityRate,
+        uint40 stableRateLastUpdated,
+        bool usageAsCollateralEnabled
+    );
+
 }
 
 // UniswapV2
@@ -187,13 +210,16 @@ contract LiquidationOperator is IUniswapV2Callee {
 
     // TODO: define constants used in the contract including ERC-20 tokens, Uniswap Pairs, Aave lending pools, etc. */
     //    *** Your code here ***
-    uint256 constant amountBorrow = 2916358033172;
+    uint256 constant amountBorrow = 2916378221683;
     address public immutable uniswapv2FactoryAddress;
     address public immutable uniswapv2RouterAddress;
     address public immutable lendingPoolAddressProvider;
+    address public immutable lendingProtocolDataProvider;
     address public immutable wbtcAddress;
     address public immutable usdtAddress;
     address public immutable wethAddress;
+    address public immutable linkAddress;
+    address public immutable usdcAddress;
     address public immutable userAddress;
     // END TODO
 
@@ -243,19 +269,21 @@ contract LiquidationOperator is IUniswapV2Callee {
         console.log("current block timestamp: ", block.timestamp);
         uniswapv2FactoryAddress = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
         uniswapv2RouterAddress = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+        lendingProtocolDataProvider = 0x057835Ad21a177dbdd3090bB1CAE03EaCF78Fc6d;
         lendingPoolAddressProvider = 0xB53C1a33016B2DC2fF3653530bfF1848a515c8c5;
         wbtcAddress = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
         usdtAddress = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
         wethAddress = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+        linkAddress = 0x514910771AF9Ca656af840dff83E8264EcF986CA;
+        usdcAddress = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
         userAddress = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
-
         // END TODO
     }
 
     // TODO: add a `receive` function so that you can withdraw your WETH
     //   *** Your code here ***
     receive() external payable {
-        console.log("received %d eth", msg.value);
+        console.log("received %d ether", msg.value);
     }
     // END TODO
 
@@ -266,26 +294,26 @@ contract LiquidationOperator is IUniswapV2Callee {
         // 0. security checks and initializing variables
         //    *** Your code here ***
         // check enough usdt for flash loan (weth-usdt flash swap)
-        console.log("calling LiqudationOperator.operate()");
-        console.log("current block number: ", block.number);
-
+        console.log("USDT to borrow: ", amountBorrow);
         IUniswapV2Factory factory = IUniswapV2Factory(uniswapv2FactoryAddress);
         IUniswapV2Pair flashSwapPair = IUniswapV2Pair(factory.getPair(wethAddress, usdtAddress));
-        (uint wethUniReserve, uint usdtUniReserve, ) = flashSwapPair.getReserves();
+        (, uint usdtUniReserve, ) = flashSwapPair.getReserves();
         require(usdtUniReserve >= amountBorrow, "UniswapV2Library: INSUFFICIENT_LIQUIDITY");
-
-        console.log("uniswapv2 WETH-USDT pool");
-        console.log("pool WETH before flash swap: ", wethUniReserve);
-        console.log("pool USDT before flash swap: ", usdtUniReserve);
 
         // 1. get the target user account data & make sure it is liquidatable
         //    *** Your code here ***
-        console.log("operate 1");
-
         ILendingPoolAddressProvider addressProvider = ILendingPoolAddressProvider(lendingPoolAddressProvider);
         ILendingPool lendingPool = ILendingPool(addressProvider.getLendingPool());
         ( , , , , , uint userHealthFactor) = lendingPool.getUserAccountData(userAddress);
         require(userHealthFactor < 10 ** health_factor_decimals, "AaveV2Library: USER NOT LIQUIDATABLE");
+
+        // avoid frontrunning
+        IPriceOracleGetter priceOracle = IPriceOracleGetter(addressProvider.getPriceOracle());
+        uint wbtcPriceInWei = priceOracle.getAssetPrice(wbtcAddress);
+//        uint linkPriceInWei = priceOracle.getAssetPrice(linkAddress);
+        uint usdtPriceInWei = priceOracle.getAssetPrice(usdtAddress);
+        require(wbtcPriceInWei * 1000 / usdtPriceInWei > 34028 * 995
+            && wbtcPriceInWei * 1000 / usdtPriceInWei < 34028 * 1005);
 
         // 2. call flash swap to liquidate the target user
         // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
@@ -293,21 +321,14 @@ contract LiquidationOperator is IUniswapV2Callee {
         // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
         //    *** Your code here ***
-        console.log("operate 2");
-        console.log("usdt to borrow from pool: ", amountBorrow);
         flashSwapPair.swap(0, amountBorrow, address(this), abi.encode(1));
 
         // 3. Convert the profit into ETH and send back to sender
         //    *** Your code here ***
-        console.log("operate 3");
-
-        // approve and withdraw WETH
+        console.log("withdraw WETH to ETH and send profit to caller");
         uint wethProfit = IWETH(wethAddress).balanceOf(address(this));
-        //        IWETH(wethAddress).approve(uniswapv2RouterAddress, wethProfit); ??
         IWETH(wethAddress).withdraw(wethProfit);
-
-        // approve and send ETH to contract caller
-        console.log("final profit: ", wethProfit);
+        console.log("profit: ", wethProfit);
         (bool sent, ) = msg.sender.call{value: wethProfit}("");
         require(sent, "FAILED TO SEND ETHER TO CONTRACT CALLER");
         // END TODO
@@ -324,63 +345,46 @@ contract LiquidationOperator is IUniswapV2Callee {
 
         // 2.0. security checks and initializing variables
         //    *** Your code here ***
-        address token0 = IUniswapV2Pair(msg.sender).token0();
-        address token1 = IUniswapV2Pair(msg.sender).token1();
-        assert(msg.sender == IUniswapV2Factory(uniswapv2FactoryAddress).getPair(token0, token1));
+        assert(msg.sender == IUniswapV2Factory(uniswapv2FactoryAddress).getPair(
+            IUniswapV2Pair(msg.sender).token0(),
+            IUniswapV2Pair(msg.sender).token1()
+        ));
 
         uint preliquidationBtcBalance = IERC20(wbtcAddress).balanceOf(address(this));
 
         // 2.1 liquidate the target user
         //    *** Your code here ***
-        console.log("uniswapV2Call 2.1");
 
-        // approve usdt spender => lendingPool
         ILendingPoolAddressProvider addressProvider = ILendingPoolAddressProvider(lendingPoolAddressProvider);
         ILendingPool lendingPool = ILendingPool(addressProvider.getLendingPool());
         IERC20(usdtAddress).approve(address(lendingPool), amount1);
 
         // call liquidationCall()
-        console.log("calling liquidationCall()");
+        console.log("liquidate user");
         lendingPool.liquidationCall(wbtcAddress, usdtAddress, userAddress, amount1, false);
         uint btcLiquidated = IERC20(wbtcAddress).balanceOf(address(this)) - preliquidationBtcBalance;
-        console.log("WBTC liquidated: ", preliquidationBtcBalance);
+        console.log("WBTC liquidated: ", btcLiquidated);
 
         // 2.2 swap WBTC for other things or repay directly
         //    *** Your code here ***
-        console.log("uniswapV2Call 2.2");
-        // approve wbtc spender = uniswapv2RouterAddress
+        console.log("swap liquidated WBTC to WETH");
         IERC20(wbtcAddress).approve(uniswapv2RouterAddress, btcLiquidated);
-        // swap WBTC -> WETH
-        address[] memory path = new address[](2);
-        path[0] = wbtcAddress;
-        path[1] = wethAddress;
-        // TODD: send WBTC to router / pair address first?
+        address[] memory path1 = new address[](2);
+        path1[0] = wbtcAddress;
+        path1[1] = wethAddress;
         IUniswapV2Router02 swapRouter = IUniswapV2Router02(uniswapv2RouterAddress);
-        swapRouter.swapExactTokensForTokens(btcLiquidated, 0, path, address(this), block.timestamp + 60 * 30);
-        // TODO: unrealistic, should check oracle price to avoid slippage
-
-        // print existing contract balance of WBTC, WETH, USDT
-        console.log("Contract WETH balance: ", IERC20(wethAddress).balanceOf(address(this)));
-        console.log("Contract WBTC balance: ", IERC20(wbtcAddress).balanceOf(address(this))); // should =0?
-        console.log("Contract USDT balance: ", IERC20(usdtAddress).balanceOf(address(this))); // should =0?
+        swapRouter.swapExactTokensForTokens(btcLiquidated, 0, path1, address(this), block.timestamp + 60 * 30);
         require(IERC20(wbtcAddress).balanceOf(address(this)) == 0, "NOT ALL WBTC SWAPPED TO WETH");
         require(IERC20(usdtAddress).balanceOf(address(this)) == 0, "NOT ALL USDT SWAPPED TO WBTC");
 
         // 2.3 repay
         //    *** Your code here ***
-        // calculate flashSwapRepayAmount (weth)
-        console.log("uniswapV2Call 2.3");
-        IUniswapV2Pair flashSwapPair = IUniswapV2Pair(msg.sender);
-        (uint wethUniReserve, uint usdtUniReserve, ) = flashSwapPair.getReserves();
+        console.log("repay flash loan in WETH");
+        (uint wethUniReserve, uint usdtUniReserve, ) = IUniswapV2Pair(msg.sender).getReserves();
         uint flashSwapRepayAmount = getAmountIn(amount1, wethUniReserve, usdtUniReserve);
-
-        // approve and send WETH back to flash swap pair (weth-usdt)
         IERC20(wethAddress).approve(msg.sender, flashSwapRepayAmount);
         IERC20(wethAddress).transfer(msg.sender, flashSwapRepayAmount);
-
-        // check profit and balances of contract
-        console.log("Contract WETH balance: ", IERC20(wethAddress).balanceOf(address(this)));
-        console.log("Profit in WETH: ", IERC20(wethAddress).balanceOf(address(this)));
+        // check profit > 0
         require(IERC20(wethAddress).balanceOf(address(this)) > 0, "NON-POSITIVE PROFIT");
         // END TODO
     }
